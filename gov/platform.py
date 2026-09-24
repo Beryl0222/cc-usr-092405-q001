@@ -2,8 +2,13 @@
 
 这是领域模块对外的唯一门面（facade）。HTTP 层与试运行脚本只调用本类，
 不直接拼装各模块，以保证分流盖戳、去标识化、分段隔离等约束集中生效。
+
+event_store_path 启用事件存储日志：事件入库、窗口定稿与分流决策追加落盘，
+进程重启后按序回放，事件幂等/冲突判定与决策序号跨重启保持一致。
 """
 
+import json
+import os
 from typing import Dict, List, Optional
 
 from . import events as ev_mod
@@ -11,21 +16,46 @@ from . import metrics as metric_dir
 from . import policies as pol_mod
 from .channels import DEFAULT_K, ChannelRegistry, kanonymize
 from .events import EventPipeline
-from .experiments import BASELINE_STRATEGY, ExperimentHub
+from .experiments import BASELINE_STRATEGY, Decision, ExperimentHub
 from .policies import PolicyRegistry
 from .privacy import PrivacyStore
 
 
 class Platform:
-    def __init__(self, now: str):
+    def __init__(self, now: str, event_store_path: Optional[str] = None):
         self.clock = now
         self.policies = PolicyRegistry()
         self.hub = ExperimentHub()
-        self.events = EventPipeline(now)
+        self.events = EventPipeline(now, store_path=event_store_path)
         self.privacy = PrivacyStore()
         self.channels = ChannelRegistry()
         # 用户人群属性（非敏感分群标签，不含观看明细），用于适用人群判定
         self._user_attrs: Dict[str, dict] = {}
+        if event_store_path:
+            self._restore_decisions(event_store_path)
+            # 时钟与已恢复的管道水位对齐，避免重启后定稿判断回退
+            self.clock = self.events.clock.isoformat()
+
+    def close(self) -> None:
+        self.events.close()
+
+    def _restore_decisions(self, path: str) -> None:
+        """从事件存储日志回放分流决策，恢复 decision_seq -> 决策 的盖戳能力。"""
+        if not os.path.exists(path):
+            return
+        restored: List[Decision] = []
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    break
+                if entry.get("op") == "decision":
+                    restored.append(Decision(**entry["decision"]))
+        self.hub.restore_decisions(restored)
 
     # ---------- 时钟 ----------
     def tick(self, now: str) -> List[str]:
@@ -93,6 +123,7 @@ class Platform:
             anon_id=anon, ts=ts, audience_match=True,
             profiling_enabled=u.profiling_enabled,
             audience_resolver=resolver)
+        self.events.journal_entry("decision", {"decision": d.public()})
         return d.public()
 
     # ---------- 事件入库（去标识化、盖戳） ----------
@@ -113,6 +144,11 @@ class Platform:
                                    "experiment" if d.in_experiment else "control")
         result = self.events.ingest(raw)
         return vars(result)
+
+    def event_conflicts(self, event_id: Optional[str] = None,
+                        day: Optional[str] = None) -> dict:
+        """冲突台账查询：同编号不同内容的重投证据，供运营圈定复核窗口。"""
+        return self.events.conflict_report(event_id=event_id, day=day)
 
     # ---------- 指标（同口径，短期/长期分开） ----------
     def report_short(self, day: str, scope: Optional[dict] = None) -> dict:

@@ -1,11 +1,14 @@
 """文化推荐策略治理的运行入口与正式 HTTP 接口。
 
 健康入口保持向后兼容；正式接口均以 /api 开头，JSON 收发。
-状态保存在单进程内存中，供联调与试运行（trial_run.py）使用。
+状态保存在单进程内存中，供联调与试运行（trial_run.py）使用；
+设置环境变量 GOV_EVENT_STORE 可启用事件存储日志，重启后事件幂等/冲突
+判定与分流决策盖戳能力跨重启恢复。
 """
 
 import argparse
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -17,7 +20,7 @@ SERVICE_NAME = "文化推荐策略治理"
 
 # 启动时钟；试运行脚本可通过 /api/clock 推进
 START_CLOCK = "2026-09-01T08:00:00"
-PLATFORM = Platform(START_CLOCK)
+PLATFORM = Platform(START_CLOCK, event_store_path=os.environ.get("GOV_EVENT_STORE"))
 
 
 def health_payload():
@@ -63,6 +66,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, catalog_snapshot())
             if path == "/api/audit":
                 return self._send(200, PLATFORM.audit())
+            if path == "/api/events/conflicts":
+                q = self._query()
+                return self._send(200, PLATFORM.event_conflicts(
+                    event_id=q.get("event_id"), day=q.get("day")))
             if path == "/api/reproduce":
                 day = self._query().get("day")
                 if not day:
@@ -129,7 +136,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, PLATFORM.route(
                     body["user_ref"], body.get("ts")))
             if path == "/api/events":
-                return self._send(200, PLATFORM.ingest(body))
+                result = PLATFORM.ingest(body)
+                # 幂等命中（duplicate）仍是 200；载荷冲突（conflict）返回 409，
+                # 调用方可据此区分"重试成功去重"与"同编号不同内容被拒"
+                code = 409 if result.get("classification") == "conflict" else 200
+                return self._send(code, result)
             if path == "/api/privacy/disable":
                 return self._send(200, PLATFORM.disable_profiling(body["user_ref"]))
             if path == "/api/privacy/reset":

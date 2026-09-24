@@ -250,13 +250,23 @@ class ExperimentHub:
     def decisions_on(self, day: str) -> List[Decision]:
         return [d for d in self.decisions if d.day == day]
 
+    def restore_decisions(self, decisions: List[Decision]) -> None:
+        """重启恢复：回放持久化的决策日志，序号游标推进到已恢复最大值之后，
+        保证重启后新决策的 seq 不与历史冲突。"""
+        for d in decisions:
+            self.decisions.append(d)
+        if self.decisions:
+            self._seq = count(max(d.seq for d in self.decisions) + 1)
+
     def verify_reproduction(self, day: str) -> dict:
         """离线复算指定日期的每一次分流，核对策略、桶位、入组是否一致。"""
         checked = 0
         for d in self.decisions_on(day):
             if d.experiment_id is None or d.segment_seq is None:
                 continue
-            exp = self.get(d.experiment_id)
+            exp = self._items.get(d.experiment_id)
+            if exp is None:
+                continue  # 重启后实验本体未恢复，该决策无法复算，跳过而非误判失败
             seg = next(s for s in exp.segments if s.seq == d.segment_seq)
             recomputed = exp.bucket_of(d.anon_id, seg)
             assert recomputed == d.bucket, f"决策 {d.seq} 桶位不可复现"

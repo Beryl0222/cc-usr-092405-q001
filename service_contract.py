@@ -128,5 +128,79 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(result["classification"], "rejected")
 
 
+class EventConflictHttpTest(unittest.TestCase):
+    """同编号重投的 HTTP 契约：幂等命中 200，载荷冲突 409，证据可查询。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from http.server import ThreadingHTTPServer
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def _post_raw(self, path, payload):
+        data = json.dumps(payload).encode("utf-8")
+        req = Request(f"{self.base_url}{path}", data=data, method="POST",
+                      headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=3) as response:
+                return response.status, json.load(response)
+        except HTTPError as exc:
+            body = json.loads(exc.read().decode("utf-8"))
+            exc.close()
+            return exc.code, body
+
+    def _get(self, path):
+        with urlopen(f"{self.base_url}{path}", timeout=3) as response:
+            return response.status, json.load(response)
+
+    def test_duplicate_is_200_and_payload_conflict_is_409(self):
+        event = {"event_id": "cf-http-1", "kind": "exposure",
+                 "occurred_at": "2026-09-02T09:00:00", "anon_id": "a1",
+                 "content_id": "hc1",
+                 "data": {"declared_duration": 100, "watch_seconds": 50}}
+        status, body = self._post_raw("/api/events", event)
+        self.assertEqual((status, body["classification"]), (200, "counted"))
+        # 真正相同的重试：幂等命中，200
+        status, body = self._post_raw("/api/events", dict(event))
+        self.assertEqual((status, body["classification"]), (200, "duplicate"))
+        # 同编号不同内容：409 + 冲突证据，调用方能明确区分
+        tampered = dict(event, content_id="hc2",
+                        data={"declared_duration": 100, "watch_seconds": 99})
+        status, body = self._post_raw("/api/events", tampered)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["classification"], "conflict")
+        self.assertFalse(body["accepted"])
+        self.assertEqual(set(body["conflict"]["differing_fields"]),
+                         {"content_id", "data"})
+        self.assertEqual(body["conflict"]["stored"]["content_id"], "hc1")
+        self.assertEqual(body["conflict"]["incoming"]["content_id"], "hc2")
+
+    def test_conflicts_are_queryable_over_http(self):
+        event = {"event_id": "cf-http-2", "kind": "favorite",
+                 "occurred_at": "2026-09-02T10:00:00", "anon_id": "a1",
+                 "content_id": "hc1"}
+        self._post_raw("/api/events", event)
+        self._post_raw("/api/events", dict(event, anon_id="a2"))
+        status, report = self._get("/api/events/conflicts?event_id=cf-http-2")
+        self.assertEqual(status, 200)
+        self.assertEqual(report["conflict_count"], 1)
+        self.assertEqual(report["conflicts"][0]["differing_fields"], ["anon_id"])
+        _, by_day = self._get("/api/events/conflicts?day=2026-09-02")
+        self.assertGreaterEqual(by_day["conflict_count"], 1)
+        # 审计视图同样暴露冲突台账
+        _, audit = self._get("/api/audit")
+        self.assertGreaterEqual(audit["events"]["conflict_count"], 1)
+        self.assertTrue(any(c["event_id"] == "cf-http-2"
+                            for c in audit["events"]["conflicts"]))
+
+
 if __name__ == "__main__":
     unittest.main()

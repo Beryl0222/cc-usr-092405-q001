@@ -1,11 +1,14 @@
 """领域规则单元测试：与 service_contract 一起由 npm test 运行。"""
 
+import os
+import tempfile
 import unittest
 
 from gov import metrics as metric_dir
 from gov.channels import ChannelRegistry, kanonymize
 from gov.events import EventPipeline
 from gov.experiments import BASELINE_STRATEGY, ExperimentHub
+from gov.platform import Platform
 from gov.policies import PolicyRegistry, ROLLOUT_CAP
 from gov.privacy import PrivacyStore
 
@@ -177,6 +180,223 @@ class EventPipelineTest(unittest.TestCase):
         pipe.ingest({"event_id": "e1", "revoke": True,
                      "received_at": "2026-09-04T01:00:00"})
         self.assertEqual(pipe.compute_short_term("2026-09-02"), before)
+
+
+# 同编号重投的基准载荷：含完整实验归属与业务数据
+CONFLICT_BASE = {
+    "event_id": "cf1", "kind": "exposure",
+    "occurred_at": "2026-09-02T09:00:00", "anon_id": "a1", "content_id": "ct1",
+    "data": {"declared_duration": 100, "watch_seconds": 50, "category": "知识讲解"},
+    "decision_seq": 7, "experiment_id": "EXP0001", "segment_seq": 1,
+    "strategy": "PL0001", "variant": "experiment",
+}
+
+
+class EventConflictTest(unittest.TestCase):
+    """同 event_id 重投：载荷相同才算重试；任一关键字段不同即为冲突。"""
+
+    def setUp(self):
+        self.pipe = EventPipeline("2026-09-02T08:00:00")
+        self.assertEqual(self.pipe.ingest(dict(CONFLICT_BASE)).classification,
+                         "counted")
+
+    def test_identical_payload_is_idempotent_even_with_later_received_at(self):
+        # received_at 是到达时间，重投天然更晚，不参与一致性比较
+        retry = dict(CONFLICT_BASE, received_at="2026-09-02T12:00:00")
+        r = self.pipe.ingest(retry)
+        self.assertEqual(r.classification, "duplicate")
+        self.assertTrue(r.accepted)
+        win = self.pipe.audit()["windows"]["2026-09-02"]
+        self.assertEqual(win["duplicate_deliveries"], 1)
+        self.assertEqual(win["conflict_deliveries"], 0)
+
+    def test_each_material_field_conflict_is_rejected_with_evidence(self):
+        variants = {
+            "kind": {"kind": "favorite"},
+            "anon_id": {"anon_id": "a2"},
+            "content_id": {"content_id": "ct2"},
+            "occurred_at": {"occurred_at": "2026-09-02T09:01:00"},
+            "data": {"data": {"declared_duration": 100, "watch_seconds": 99}},
+            "experiment_id": {"experiment_id": "EXP0002"},
+            "segment_seq": {"segment_seq": 2},
+            "strategy": {"strategy": "PL0002"},
+            "variant": {"variant": "control"},
+            "decision_seq": {"decision_seq": 8},
+        }
+        for field_name, patch in variants.items():
+            pipe = EventPipeline("2026-09-02T08:00:00")
+            pipe.ingest(dict(CONFLICT_BASE))
+            r = pipe.ingest({**CONFLICT_BASE, **patch})
+            self.assertEqual(r.classification, "conflict", field_name)
+            self.assertFalse(r.accepted, field_name)
+            self.assertEqual(r.conflict["differing_fields"], [field_name])
+            # 证据中两份内容都要留档，可查询
+            self.assertEqual(r.conflict["stored"][field_name],
+                             CONFLICT_BASE[field_name])
+            self.assertEqual(r.conflict["incoming"][field_name],
+                             {**CONFLICT_BASE, **patch}[field_name])
+            self.assertEqual(r.conflict["day"], "2026-09-02")
+            self.assertEqual(len(pipe.conflict_ledger), 1)
+
+    def test_conflict_never_overwrites_metrics(self):
+        before = self.pipe.compute_short_term("2026-09-02")
+        # 若被覆盖，完播率会从 0.5 变成 0.99
+        r = self.pipe.ingest({**CONFLICT_BASE,
+                              "data": {"declared_duration": 100, "watch_seconds": 99}})
+        self.assertEqual(r.classification, "conflict")
+        after = self.pipe.compute_short_term("2026-09-02")
+        self.assertEqual(after, before)
+        self.assertEqual(after["metrics"]["completion_rate"], 0.5)
+        # 冲突之后真正相同的重试仍然只计一次
+        self.assertEqual(self.pipe.ingest(dict(CONFLICT_BASE)).classification,
+                         "duplicate")
+        self.assertEqual(self.pipe.compute_short_term("2026-09-02"), before)
+
+    def test_conflict_after_finalization_is_still_detected_and_flagged(self):
+        # 撤回先到不能破坏判断；定稿后冲突重投也要被识别（而非伪装成迟到隔离）
+        self.pipe.finalize_due("2026-09-04T00:00:00")
+        before = self.pipe.compute_short_term("2026-09-02")
+        r = self.pipe.ingest({
+            **CONFLICT_BASE, "received_at": "2026-09-05T09:00:00",
+            "data": {"declared_duration": 100, "watch_seconds": 99}})
+        self.assertEqual(r.classification, "conflict")
+        self.assertTrue(r.conflict["window_finalized"],
+                        "证据必须标明冲突命中的窗口已定稿，需要人工复核")
+        self.assertEqual(self.pipe.compute_short_term("2026-09-02"), before)
+        # 同编号真正相同的重投即使在定稿后也仍是幂等命中
+        ok = self.pipe.ingest({**CONFLICT_BASE,
+                               "received_at": "2026-09-05T09:05:00"})
+        self.assertEqual(ok.classification, "duplicate")
+
+    def test_revoke_then_redelivery_keeps_single_truth(self):
+        # 原事件已撤回：相同重投仍为幂等且保持作废；不同内容仍是冲突
+        self.assertEqual(self.pipe.ingest(
+            {"event_id": "cf1", "revoke": True,
+             "received_at": "2026-09-02T10:00:00"}).classification, "counted")
+        revoked = lambda: self.pipe.audit()["windows"]["2026-09-02"]["revoked"]
+        self.assertEqual(revoked(), 1)
+        self.assertEqual(self.pipe.ingest(dict(CONFLICT_BASE)).classification,
+                         "duplicate")
+        self.assertEqual(revoked(), 1, "幂等重投不得把已撤回事件复活")
+        r = self.pipe.ingest({**CONFLICT_BASE, "anon_id": "a9"})
+        self.assertEqual(r.classification, "conflict")
+
+    def test_conflict_report_is_queryable_by_event_and_day(self):
+        other = {**CONFLICT_BASE, "event_id": "cf_other"}
+        self.pipe.ingest(dict(other))
+        self.pipe.ingest({**CONFLICT_BASE, "anon_id": "a2"})
+        self.pipe.ingest({**other, "anon_id": "a3"})
+        by_event = self.pipe.conflict_report(event_id="cf1")
+        self.assertEqual(by_event["conflict_count"], 1)
+        by_day = self.pipe.conflict_report(day="2026-09-02")
+        self.assertEqual(by_day["conflict_count"], 2)
+        self.assertEqual(self.pipe.conflict_report(day="2026-09-03"),
+                         {"conflict_count": 0, "conflicts": []})
+
+
+class PipelineRestartTest(unittest.TestCase):
+    """重启恢复：首条记录、冲突台账、定稿状态与挂起撤回跨重启保持判断。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "events.log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pipe(self):
+        return EventPipeline("2026-09-02T08:00:00", store_path=self.path)
+
+    def test_idempotency_and_conflict_judgments_survive_restart(self):
+        pipe = self._pipe()
+        pipe.ingest(dict(CONFLICT_BASE))
+        pipe.ingest(dict(CONFLICT_BASE))  # 幂等一次
+        pipe.ingest({**CONFLICT_BASE, "data": {"declared_duration": 100,
+                                               "watch_seconds": 99}})
+        # 挂起的撤回也必须随日志恢复
+        pipe.ingest({"event_id": "rr1", "revoke": True,
+                     "received_at": "2026-09-02T11:00:00"})
+        before = pipe.compute_short_term("2026-09-02")
+        pipe.close()
+
+        restored = self._pipe()
+        self.assertEqual(restored.compute_short_term("2026-09-02"), before)
+        self.assertEqual(len(restored.conflict_ledger), 1)
+        self.assertIn("rr1", restored.audit()["pending_revokes"])
+        # 挂起撤回恢复后，原事件到达即作废
+        r = restored.ingest({"event_id": "rr1", "kind": "favorite",
+                             "occurred_at": "2026-09-02T11:05:00",
+                             "anon_id": "a1", "content_id": "ct1"})
+        self.assertEqual(r.classification, "revoked_on_arrival")
+        # 幂等判断延续：相同重投计数继续累加
+        self.assertEqual(restored.ingest(dict(CONFLICT_BASE)).classification,
+                         "duplicate")
+        # 冲突判断延续：不同内容再次被拒，台账继续追加
+        r = restored.ingest({**CONFLICT_BASE, "anon_id": "a2"})
+        self.assertEqual(r.classification, "conflict")
+        self.assertEqual(len(restored.conflict_ledger), 2)
+        restored.close()
+
+    def test_finalized_window_and_late_quarantine_survive_restart(self):
+        pipe = self._pipe()
+        pipe.ingest(dict(CONFLICT_BASE))
+        pipe.finalize_due("2026-09-04T00:00:00")
+        before = pipe.compute_short_term("2026-09-02")
+        pipe.close()
+
+        restored = self._pipe()  # 恢复时不重放定稿之外的时钟动作
+        self.assertTrue(
+            restored.audit()["windows"]["2026-09-02"]["finalized"])
+        late = restored.ingest({
+            "event_id": "late1", "kind": "favorite",
+            "occurred_at": "2026-09-02T22:00:00",
+            "received_at": "2026-09-04T01:00:00",
+            "anon_id": "a1", "content_id": "ct1"})
+        self.assertEqual(late.classification, "quarantined_late")
+        # 定稿后的冲突重投同样被识别，且指标保持冻结
+        conflict = restored.ingest({**CONFLICT_BASE, "anon_id": "a2"})
+        self.assertEqual(conflict.classification, "conflict")
+        self.assertEqual(restored.compute_short_term("2026-09-02"), before)
+        restored.close()
+
+
+class PlatformRestartTest(unittest.TestCase):
+    """平台级重启：分流决策盖戳能力恢复，指标不被冲突重投改写。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "events.log")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_decision_stamping_and_conflict_judgment_survive_restart(self):
+        pf = Platform("2026-09-01T08:00:00", event_store_path=self.path)
+        d = pf.route("u_rt", "2026-09-02T09:00:00")
+        event = {"event_id": "pe1", "kind": "exposure",
+                 "occurred_at": "2026-09-02T09:00:00",
+                 "decision_seq": d["seq"], "content_id": "ct1",
+                 "data": {"declared_duration": 100, "watch_seconds": 50}}
+        self.assertEqual(pf.ingest(event)["classification"], "counted")
+        self.assertEqual(pf.ingest({**event, "data": {
+            "declared_duration": 100, "watch_seconds": 99}})["classification"],
+            "conflict")
+        before = pf.report_short("2026-09-02")
+        pf.close()
+
+        pf2 = Platform("2026-09-01T08:00:00", event_store_path=self.path)
+        # 决策日志恢复：仅给 decision_seq 仍能盖戳，同载荷识别为重试
+        self.assertEqual(pf2.ingest(event)["classification"], "duplicate")
+        self.assertEqual(pf2.ingest({**event, "data": {
+            "declared_duration": 100, "watch_seconds": 99}})["classification"],
+            "conflict")
+        self.assertEqual(pf2.report_short("2026-09-02"), before)
+        # 决策序号游标恢复，重启后不产生重复 seq
+        d2 = pf2.route("u_rt", "2026-09-02T10:00:00")
+        self.assertEqual(d2["seq"], d["seq"] + 1)
+        pf2.close()
 
 
 class PrivacyTest(unittest.TestCase):

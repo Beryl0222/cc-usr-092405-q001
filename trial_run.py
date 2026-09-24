@@ -3,7 +3,8 @@
 覆盖需求点名的场景：
 1. 策略提交（目标/权重/人群/有效期）→ 内容+风险双批准 → 小流量分发；
 2. 长内容（知识长讲解、非遗慢直播）与短视频共存，多信号口径不偏向短视频；
-3. 事件迟到、撤回（含乱序先到）、重复投递均不污染指标；定稿窗口冻结；
+3. 事件迟到、撤回（含乱序先到）、重复投递均不污染指标；同编号不同内容的
+   冲突重投被拒绝并留证据；定稿窗口冻结；存储日志回放后重启不破坏判断；
 4. 实验中途调权另开分段，回滚后分流回落基线，分段独立统计；
 5. 复现某日每一次分流采用的策略与桶位；
 6. 不偷换口径地比较短期互动与长期回访（口径版本一致、分母一致）；
@@ -141,6 +142,46 @@ def main():
 
     metrics_before = pf.report_short(DAY1)
 
+    # 4b) 缓存损坏导致"同编号不同内容"重投：拒绝覆盖，证据留台账，指标不变 --
+    conflict_cases = [
+        ("业务数据被改", dict(dup, data={"watch_seconds": 99})),
+        ("内容被换", {"event_id": dup["event_id"], "kind": "favorite",
+                     "occurred_at": f"{DAY1}T15:00:00",
+                     "decision_seq": target.seq,
+                     "content_id": SLOW_LIVE["content_id"]}),
+        ("事件类型被换", dict(dup, kind="comment")),
+        ("匿名主体被换", {"event_id": dup["event_id"], "kind": "favorite",
+                        "occurred_at": f"{DAY1}T15:00:00",
+                        "decision_seq": target.seq, "anon_id": "a_corrupt",
+                        "content_id": LONG_LECTURE["content_id"]}),
+        ("实验归属被换", {"event_id": dup["event_id"], "kind": "favorite",
+                        "occurred_at": f"{DAY1}T15:00:00",
+                        "experiment_id": "EXP_FAKE", "segment_seq": 9,
+                        "strategy": "PL_FAKE", "variant": "experiment",
+                        "anon_id": pf.privacy.anon_id(f"u000"),
+                        "content_id": LONG_LECTURE["content_id"]}),
+        ("发生时间被换", dict(dup, occurred_at=f"{DAY1}T15:01:00")),
+    ]
+    for label, bad in conflict_cases:
+        rc = pf.ingest(bad)
+        assert rc["classification"] == "conflict", f"{label} 必须判为冲突"
+        assert rc["accepted"] is False
+        assert rc["conflict"]["stored"]["content_id"], "证据须保留首条记录内容"
+    # 首条记录原封不动：指标不被任何冲突重投改写
+    assert pf.report_short(DAY1) == metrics_before, "冲突重投不得改写指标"
+    # 真正相同的重试依旧只计一次，且不与冲突台账混淆
+    assert pf.ingest(dict(dup))["classification"] == "duplicate"
+    # 已被"撤回先到"作废的事件，损坏重投也不能复活它
+    rc = pf.ingest({"event_id": "REORDER-1", "kind": "comment",
+                    "occurred_at": f"{DAY1}T12:00:00",
+                    "anon_id": "a_corrupt", "content_id": "c9"})
+    assert rc["classification"] == "conflict"
+    assert pf.report_short(DAY1) == metrics_before
+    # 冲突证据可按窗口查询，运营据此圈定需要复核的实验窗口
+    conflicts_day1 = pf.event_conflicts(day=DAY1)
+    assert conflicts_day1["conflict_count"] == len(conflict_cases) + 1
+    assert all(c["day"] == DAY1 for c in conflicts_day1["conflicts"])
+
     # 5) 中途调权：新策略双批准 + 另开分段（DAY1 窗口尚未定稿） -----------
     pf.tick(T_ADJUST)
     p2 = pf.submit_policy(build_policy(WEIGHTS_V2, "V2"))
@@ -186,9 +227,23 @@ def main():
     assert r4["classification"] == "quarantined_late"
     assert pf.report_short(DAY1) == metrics_before, "定稿后指标必须保持冻结"
 
+    # 定稿后的冲突重投：判冲突（而非普通迟到隔离），证据标记窗口已定稿
+    rc = pf.ingest({"event_id": f"DUP-{target.seq}", "kind": "favorite",
+                    "occurred_at": f"{DAY1}T15:00:00",
+                    "decision_seq": target.seq,
+                    "content_id": SHORT_VIDEO["content_id"],
+                    "received_at": "2026-09-05T09:10:00"})
+    assert rc["classification"] == "conflict"
+    assert rc["conflict"]["window_finalized"] is True, "证据须标记命中已定稿窗口"
+    assert pf.report_short(DAY1) == metrics_before, "定稿后冲突重投不得改写指标"
+
     # 乱序无害：同一批事件以任意顺序喂给独立管道，结果逐位一致
     order_independent = demonstrate_order_independence()
     assert order_independent
+
+    # 重启恢复：事件与决策日志落盘，重启后幂等/冲突/定稿判断不变
+    restart_ok = demonstrate_restart_recovery()
+    assert restart_ok
 
     # 8) 长期回访：d7 成熟给终值，d30 未成熟只标 pending；再推进后出终值 ---
     # 给实验桶用户造跨日回访（落在 7 日窗口内）
@@ -274,10 +329,12 @@ def main():
         "experiment": final_row["short_term"], "control": control_row["short_term"]})
     show("长期回访（口径一致，成熟后终值）", {
         "experiment": final_row["long_term"], "control": control_row["long_term"]})
-    show("定稿后迟到数据隔离与修订台账", {
+    show("定稿后迟到数据隔离、冲突证据与修订台账", {
         "quarantine": pf.events.audit()["quarantine"],
         "revision_ledger": pf.events.audit()["revision_ledger"],
+        "conflicts": pf.event_conflicts(day=DAY1)["conflicts"],
         "duplicate_deliveries": pf.events.audit()["windows"][DAY1]["duplicate_deliveries"],
+        "conflict_deliveries": pf.events.audit()["windows"][DAY1]["conflict_deliveries"],
     })
     show("兴趣重置后的隐私状态", after_reset)
     show("创作者通道解释", explanation)
@@ -310,6 +367,64 @@ def demonstrate_order_independence() -> bool:
     return p1.compute_short_term(base_day) == p2.compute_short_term(base_day) \
         and p1.audit()["windows"][base_day]["revoked"] == 1 \
         and p2.audit()["windows"][base_day]["revoked"] == 1
+
+
+def demonstrate_restart_recovery() -> bool:
+    """重启恢复证明：同一存储日志重建平台后——
+
+    - 首条记录仍在：相同重投判幂等，不同内容判冲突，指标逐位一致；
+    - 挂起的撤回、定稿状态、迟到隔离与冲突台账全部跨重启延续；
+    - 分流决策日志恢复，decision_seq 盖戳能力不丢，新决策序号不与历史冲突。
+    """
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "events.log")
+        day = "2026-09-02"
+        p1 = Platform("2026-09-01T08:00:00", event_store_path=store)
+        p1.set_user_attributes("u_rt", {"taste": "culture"})
+        d = p1.route("u_rt", f"{day}T09:00:00")
+        event = {"event_id": "RT-1", "kind": "exposure",
+                 "occurred_at": f"{day}T09:00:00", "decision_seq": d["seq"],
+                 "content_id": "c1",
+                 "data": {"declared_duration": 100, "watch_seconds": 50}}
+        assert p1.ingest(event)["classification"] == "counted"
+        assert p1.ingest(dict(event))["classification"] == "duplicate"
+        tampered = dict(event, data={"declared_duration": 100,
+                                     "watch_seconds": 99})
+        assert p1.ingest(tampered)["classification"] == "conflict"
+        # 撤回先到（挂起）与窗口定稿都发生在重启前
+        assert p1.ingest({"event_id": "RT-2", "revoke": True,
+                          "received_at": f"{day}T10:00:00"})["classification"] \
+            == "pending_revoke"
+        p1.tick("2026-09-04T00:00:00")  # 定稿 day 窗口
+        before = p1.report_short(day)
+        p1.close()
+
+        # —— 模拟进程重启：同一存储路径重建 ——
+        p2 = Platform("2026-09-01T08:00:00", event_store_path=store)
+        if p2.report_short(day) != before:
+            return False
+        # 挂起的撤回恢复：迟到的原事件进入隔离区，不会复活计入
+        assert p2.ingest({"event_id": "RT-2", "kind": "favorite",
+                          "occurred_at": f"{day}T10:05:00",
+                          "received_at": "2026-09-04T01:00:00",
+                          "anon_id": "a9", "content_id": "c1"})["classification"] \
+            == "quarantined_late"
+        # 幂等判断延续（含决策盖戳恢复：只给 decision_seq 也认得出是同一载荷）
+        assert p2.ingest(dict(event))["classification"] == "duplicate"
+        # 冲突判断延续：定稿后的篡改重投仍被拒，证据标记窗口已定稿
+        rc = p2.ingest(tampered)
+        assert rc["classification"] == "conflict"
+        assert rc["conflict"]["window_finalized"] is True
+        assert len(p2.event_conflicts(day=day)["conflicts"]) == 2
+        # 决策序号游标恢复：新分流 seq 单调不与历史冲突
+        d2 = p2.route("u_rt", "2026-09-04T09:00:00")
+        assert d2["seq"] == d["seq"] + 1
+        ok = p2.report_short(day) == before
+        p2.close()
+        return ok
 
 
 if __name__ == "__main__":
