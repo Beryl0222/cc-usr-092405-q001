@@ -63,6 +63,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, catalog_snapshot())
             if path == "/api/audit":
                 return self._send(200, PLATFORM.audit())
+            if path == "/api/events/conflicts":
+                event_id = self._query().get("event_id")
+                rows = PLATFORM.conflicts(event_id)
+                return self._send(200, {"count": len(rows), "conflicts": rows})
+            if path == "/api/state/dump":
+                return self._send(200, PLATFORM.dump_state())
             if path == "/api/reproduce":
                 day = self._query().get("day")
                 if not day:
@@ -129,7 +135,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, PLATFORM.route(
                     body["user_ref"], body.get("ts")))
             if path == "/api/events":
-                return self._send(200, PLATFORM.ingest(body))
+                result = PLATFORM.ingest(body)
+                # 幂等命中（counted/duplicate）与正常入库返回 200；
+                # 同编号载荷冲突返回 409，调用方必须能与幂等命中区分。
+                code = 409 if result.get("classification") == "conflict" else 200
+                return self._send(code, result)
+            if path == "/api/state/restore":
+                restored = Platform.restore_state(body)
+                PLATFORM.__dict__.update(restored.__dict__)
+                return self._send(200, {"ok": True, "clock": PLATFORM.clock})
             if path == "/api/privacy/disable":
                 return self._send(200, PLATFORM.disable_profiling(body["user_ref"]))
             if path == "/api/privacy/reset":

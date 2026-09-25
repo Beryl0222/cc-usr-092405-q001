@@ -51,6 +51,19 @@ class Pseudonymizer:
     def epochs_live(self) -> List[int]:
         return sorted(self._salts)
 
+    def dump_state(self) -> dict:
+        # 盐值属于服务端秘密：仅用于同进程持久化/重启恢复，不随对外接口暴露
+        return {"current_epoch": self.current_epoch,
+                "salts": {str(e): s.hex() for e, s in self._salts.items()}}
+
+    @classmethod
+    def restore_state(cls, state: dict) -> "Pseudonymizer":
+        pseudo = cls()
+        pseudo.current_epoch = state["current_epoch"]
+        pseudo._salts = {int(e): bytes.fromhex(s)
+                         for e, s in state.get("salts", {}).items()}
+        return pseudo
+
 
 @dataclass
 class UserProfile:
@@ -136,3 +149,32 @@ class PrivacyStore:
             "disabled_at": u.disabled_at,
             "history": list(u.history),
         }
+
+    # ---------- 快照与恢复（重启后画像开关/纪元与假名保持一致） ----------
+
+    def dump_state(self) -> dict:
+        return {
+            "pseudonymizer": self.pseudo.dump_state(),
+            "users": [
+                {"user_ref": u.user_ref, "epoch": u.epoch,
+                 "profiling_enabled": u.profiling_enabled,
+                 "preferences": dict(u.preferences),
+                 "reset_at": u.reset_at, "disabled_at": u.disabled_at,
+                 "history": list(u.history)}
+                for u in self._users.values()],
+        }
+
+    @classmethod
+    def restore_state(cls, state: dict) -> "PrivacyStore":
+        store = cls()
+        store.pseudo = Pseudonymizer.restore_state(state["pseudonymizer"])
+        for us in state.get("users", []):
+            u = UserProfile(
+                user_ref=us["user_ref"], epoch=us["epoch"],
+                profiling_enabled=us["profiling_enabled"],
+                preferences=dict(us.get("preferences", {})),
+                reset_at=us.get("reset_at"),
+                disabled_at=us.get("disabled_at"),
+                history=list(us.get("history", [])))
+            store._users[u.user_ref] = u
+        return store

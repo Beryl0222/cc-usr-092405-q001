@@ -267,3 +267,39 @@ class ExperimentHub:
             checked += 1
         return {"day": day, "decisions": len(self.decisions_on(day)),
                 "recomputed": checked, "reproducible": True}
+
+    # ---------- 快照与恢复（重启后分段、决策日志与分桶确定性不丢失） ----------
+
+    def dump_state(self) -> dict:
+        return {
+            "experiments": [
+                {"id": e.id, "name": e.name, "salt": e.salt,
+                 "rolled_back": e.rolled_back,
+                 "segments": [
+                     {"seq": s.seq, "policy_id": s.policy_id,
+                      "weights": dict(s.weights), "rollout": s.rollout,
+                      "catalog_version": s.catalog_version, "salt": s.salt,
+                      "start_ts": s.start_ts, "end_ts": s.end_ts,
+                      "close_reason": s.close_reason}
+                     for s in e.segments]}
+                for e in self._items.values()],
+            "decisions": [vars(d) for d in self.decisions],
+        }
+
+    @classmethod
+    def restore_state(cls, state: dict) -> "ExperimentHub":
+        hub = cls()
+        max_exp = 0
+        for es in state.get("experiments", []):
+            exp = Experiment.__new__(Experiment)
+            exp.id = es["id"]
+            exp.name = es["name"]
+            exp.salt = es["salt"]
+            exp.rolled_back = es["rolled_back"]
+            exp.segments = [Segment(**s) for s in es["segments"]]
+            hub._items[exp.id] = exp
+            max_exp = max(max_exp, int(exp.id[3:]))
+        hub._ids = count(max_exp + 1)
+        hub.decisions = [Decision(**d) for d in state.get("decisions", [])]
+        hub._seq = count(max((d.seq for d in hub.decisions), default=0) + 1)
+        return hub

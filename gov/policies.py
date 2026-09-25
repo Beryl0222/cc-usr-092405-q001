@@ -177,3 +177,28 @@ class PolicyRegistry:
 
     def list(self) -> List[Policy]:
         return list(self._items.values())
+
+    # ---------- 快照与恢复（进程重启后审批状态不丢失、不可被重放绕过） ----------
+
+    def dump_state(self) -> dict:
+        return {"policies": [p.public() for p in self._items.values()]}
+
+    @classmethod
+    def restore_state(cls, state: dict) -> "PolicyRegistry":
+        reg = cls()
+        max_id = 0
+        for ps in state.get("policies", []):
+            p = Policy(
+                id=ps["id"], title=ps["title"], goal=ps["goal"],
+                weights=dict(ps["weights"]), audience=ps["audience"],
+                effective_from=ps["effective_from"],
+                effective_to=ps["effective_to"], owner=ps["owner"],
+                rollout=ps["rollout"], status=ps["status"],
+                catalog_version=ps.get("catalog_version", metric_dir.CATALOG_VERSION),
+                approvals=[Approval(**a) for a in ps.get("approvals", [])],
+                timeline=list(ps.get("timeline", [])),
+                reject_reason=ps.get("reject_reason"))
+            reg._items[p.id] = p
+            max_id = max(max_id, int(p.id[2:]))
+        reg._ids = count(max_id + 1)
+        return reg

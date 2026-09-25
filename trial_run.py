@@ -141,6 +141,34 @@ def main():
 
     metrics_before = pf.report_short(DAY1)
 
+    # 4b) 同编号异载（本地缓存损坏重发）：拒绝覆盖、留可查询冲突证据 ----------
+    # 真正相同的重试仍只计一次；但同编号只要任一语义字段不同即冲突。
+    # 复用决策盖戳补全 anon/归属，并对齐首条的内容与时间，使差异恰好只有被改字段。
+    orig_content = contents[target.seq % 3]
+    clash_id = f"FAV-{target.seq}"  # 步骤 3 已计入的收藏事件（T10:00:00）
+    clash_mutations = [
+        ({"data": {"quality_pass": True, "tampered": True}}, "业务数据"),
+        ({"kind": "comment"}, "事件类型"),
+    ]
+    for mutation, label in clash_mutations:
+        bad = {"event_id": clash_id, "kind": "favorite",
+               "occurred_at": f"{DAY1}T10:00:00",
+               "decision_seq": target.seq,
+               "content_id": orig_content["content_id"]}
+        bad.update(mutation)
+        rc = pf.ingest(bad)
+        assert rc["classification"] == "conflict", f"{label} 差异必须判为冲突"
+        assert rc["accepted"] is False
+        assert pf.conflicts(clash_id)[-1]["differences"] == [
+            "data" if label == "业务数据" else "kind"]
+    assert pf.report_short(DAY1) == metrics_before, "冲突重投不得改写指标"
+    # 冲突后真正相同的重试仍是幂等命中，不会双计
+    rc_same = pf.ingest({
+        "event_id": clash_id, "kind": "favorite",
+        "occurred_at": f"{DAY1}T10:00:00", "decision_seq": target.seq,
+        "content_id": orig_content["content_id"]})
+    assert rc_same["classification"] == "duplicate"
+
     # 5) 中途调权：新策略双批准 + 另开分段（DAY1 窗口尚未定稿） -----------
     pf.tick(T_ADJUST)
     p2 = pf.submit_policy(build_policy(WEIGHTS_V2, "V2"))
@@ -189,6 +217,28 @@ def main():
     # 乱序无害：同一批事件以任意顺序喂给独立管道，结果逐位一致
     order_independent = demonstrate_order_independence()
     assert order_independent
+
+    # 7b) 重启恢复：从快照重建进程，幂等/冲突/定稿判断必须与重启前一致 -------
+    snapshot = pf.dump_state()
+    pf2 = Platform.restore_state(snapshot)
+    assert pf2.report_short(DAY1) == pf.report_short(DAY1), "重启后指标必须逐位一致"
+    assert pf2.events.audit()["windows"][DAY1]["finalized"]
+    assert len(pf2.conflicts(clash_id)) == 2, "冲突证据必须随重启保留"
+    # 重启后相同重试仍幂等（不双计、不误报冲突）
+    assert pf2.ingest({
+        "event_id": clash_id, "kind": "favorite",
+        "occurred_at": f"{DAY1}T10:00:00", "decision_seq": target.seq,
+        "content_id": orig_content["content_id"]})["classification"] == "duplicate"
+    # 重启后又一个异载仍被拒绝并追加证据，首条指标不动
+    frozen_after_restart = pf2.report_short(DAY1)
+    rc_restart = pf2.ingest({
+        "event_id": clash_id, "kind": "favorite",
+        "occurred_at": f"{DAY1}T10:00:00", "decision_seq": target.seq,
+        "content_id": orig_content["content_id"],
+        "data": {"injected_after_restart": True}})
+    assert rc_restart["classification"] == "conflict"
+    assert pf2.report_short(DAY1) == frozen_after_restart
+    assert len(pf2.conflicts(clash_id)) == 3
 
     # 8) 长期回访：d7 成熟给终值，d30 未成熟只标 pending；再推进后出终值 ---
     # 给实验桶用户造跨日回访（落在 7 日窗口内）
@@ -278,6 +328,15 @@ def main():
         "quarantine": pf.events.audit()["quarantine"],
         "revision_ledger": pf.events.audit()["revision_ledger"],
         "duplicate_deliveries": pf.events.audit()["windows"][DAY1]["duplicate_deliveries"],
+    })
+    show("同编号异载冲突证据（首条保留、拒绝覆盖、重启后仍可查）", {
+        "conflict_count": len(pf.conflicts()),
+        "conflicts": [
+            {"event_id": c["event_id"], "differences": c["difference_labels"],
+             "challenger_after_finalization": c["challenger_after_finalization"],
+             "first_kind": c["first"]["kind"],
+             "challenger_kind": c["challenger"]["kind"]}
+            for c in pf.conflicts()],
     })
     show("兴趣重置后的隐私状态", after_reset)
     show("创作者通道解释", explanation)

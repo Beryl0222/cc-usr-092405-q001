@@ -114,6 +114,37 @@ class Platform:
         result = self.events.ingest(raw)
         return vars(result)
 
+    def conflicts(self, event_id: Optional[str] = None) -> List[dict]:
+        """同编号异载冲突证据，供运营定位需复核的实验窗口。"""
+        return self.events.conflicts(event_id)
+
+    # ---------- 快照与恢复（进程重启不破坏幂等/冲突/定稿判断） ----------
+
+    def dump_state(self) -> dict:
+        """导出全量可 JSON 持久化状态。"""
+        return {
+            "clock": self.clock,
+            "policies": self.policies.dump_state(),
+            "experiments": self.hub.dump_state(),
+            "events": self.events.dump_state(),
+            "privacy": self.privacy.dump_state(),
+            "channels": self.channels.dump_state(),
+            "user_attrs": dict(self._user_attrs),
+        }
+
+    @classmethod
+    def restore_state(cls, state: dict) -> "Platform":
+        """从 dump_state 快照恢复平台：所有判定与重启前一致。"""
+        pf = cls.__new__(cls)
+        pf.clock = state["clock"]
+        pf.policies = pol_mod.PolicyRegistry.restore_state(state["policies"])
+        pf.hub = ExperimentHub.restore_state(state["experiments"])
+        pf.events = EventPipeline.restore_state(state["events"])
+        pf.privacy = PrivacyStore.restore_state(state["privacy"])
+        pf.channels = ChannelRegistry.restore_state(state["channels"])
+        pf._user_attrs = {k: dict(v) for k, v in state.get("user_attrs", {}).items()}
+        return pf
+
     # ---------- 指标（同口径，短期/长期分开） ----------
     def report_short(self, day: str, scope: Optional[dict] = None) -> dict:
         return self.events.compute_short_term(day, scope)

@@ -81,6 +81,26 @@ class ChannelRegistry:
                 if r.creator_id == creator_id and r.seq ==
                 max(x.seq for x in self._records if x.content_id == r.content_id)]
 
+    # ---------- 快照与恢复（重启后进出原因链不丢失） ----------
+
+    def dump_state(self) -> dict:
+        return {"channel_name": self.channel_name,
+                "records": [r.public() for r in self._records]}
+
+    @classmethod
+    def restore_state(cls, state: dict) -> "ChannelRegistry":
+        reg = cls(state.get("channel_name", "文化长内容独立通道"))
+        records = [ChannelRecord(
+            content_id=r["content_id"], creator_id=r["creator_id"],
+            in_channel=r["in_channel"], reason=r["reason"],
+            signals=dict(r.get("signals", {})), basis=r["basis"],
+            at=r["at"], seq=r["seq"]) for r in state.get("records", [])]
+        reg._records = records
+        for r in records:  # 最新状态 = 每内容最后一条
+            reg._current[r.content_id] = r
+        reg._seq = count(max((r.seq for r in records), default=0) + 1)
+        return reg
+
 
 def kanonymize(groups: Dict[str, dict], k: int = DEFAULT_K) -> dict:
     """对分组聚合做 k 匿名。
